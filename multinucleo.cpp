@@ -7,6 +7,7 @@
 #include <numeric>
 #include <omp.h>
 #include <algorithm>
+#include <parallel/algorithm>
 
 // Configuración
 int width = 1920;
@@ -20,9 +21,9 @@ int subdiv_z = 200;
 const float sky_height = 20.0f;
 const int sky_subdiv_x = 150;
 const int sky_subdiv_z = 50;
-const float sky_plane_width = 1600.0f; // Define sky grid plane width
-const float sky_plane_depth = 800.0f; // Define sky grid plane depth
-const cv::Scalar sky_color = cv::Scalar(255, 0, 0); // Blue color for the sky grid
+const float sky_plane_width = 1600.0f;
+const float sky_plane_depth = 800.0f;
+const cv::Scalar sky_color = cv::Scalar(255, 0, 0);
 
 cv::Vec3f camera_position;
 cv::Vec3f camera_rotation;
@@ -61,8 +62,18 @@ const float scroll_speed = 0.05f;
 std::vector<std::vector<cv::Vec2f>> base_grid;
 std::vector<std::vector<cv::Vec2f>> sky_grid;
 
+struct Dot {
+    cv::Point pt;
+    int radius;
+    cv::Scalar color;
+    float depth;
+};
+
+const int NUM_THREADS = omp_get_max_threads();
+
 void generate_base_grid() {
     base_grid.resize(subdiv_x + 1, std::vector<cv::Vec2f>(subdiv_z + 1));
+    #pragma omp parallel for collapse(2)
     for (int i = 0; i <= subdiv_x; ++i) {
         for (int j = 0; j <= subdiv_z; ++j) {
             float x = -plane_width / 2 + i * (plane_width / subdiv_x);
@@ -74,6 +85,7 @@ void generate_base_grid() {
 
 void generate_sky_grid() {
     sky_grid.resize(sky_subdiv_x + 1, std::vector<cv::Vec2f>(sky_subdiv_z + 1));
+    #pragma omp parallel for collapse(2)
     for (int i = 0; i <= sky_subdiv_x; ++i) {
         for (int j = 0; j <= sky_subdiv_z; ++j) {
             float x = -sky_plane_width / 2 + i * (sky_plane_width / sky_subdiv_x);
@@ -90,6 +102,7 @@ void init_permutation() {
     std::iota(p.begin(), p.end(), 0);
     std::default_random_engine engine(42);
     std::shuffle(p.begin(), p.end(), engine);
+    #pragma omp parallel for
     for (int i = 0; i < 512; ++i)
         perm[i] = p[i % 256];
 }
@@ -161,10 +174,9 @@ cv::Matx33f get_rotation_matrix(const cv::Vec3f& angles) {
 bool project_point(const cv::Vec3f& point3D, cv::Point& projected) {
     cv::Matx33f R = get_rotation_matrix(camera_rotation);
     cv::Vec3f relative = point3D - camera_position;
-    // Apply rotation
     cv::Vec3f rotated = R * relative;
     float x = rotated[0], y = rotated[1], z = rotated[2];
-    if (z <= 0.01f) return false;  // Behind camera
+    if (z <= 0.01f) return false;
     int u = static_cast<int>(width / 2 + focal_length * x / z);
     int v = static_cast<int>(height / 2 - focal_length * y / z);
     if (u < 0 || u >= width || v < 0 || v >= height) return false;
@@ -179,22 +191,21 @@ int compute_radius(float z) {
     return std::round(max_circle_radius * (1.0f - norm) + min_circle_radius * norm);
 }
 
-// Gradient color stops
 struct ColorStop {
-    float position;  // From -1.0 to 1.0
+    float position;
     cv::Scalar color;
 };
 
 std::vector<ColorStop> color_gradient = {
-    {-0.3f, cv::Scalar(50, 10, 10)},       // Very deep water - dark blue
-    {-0.2f, cv::Scalar(100, 20, 20)},      // Deep water
-    {-0.1f, cv::Scalar(150, 60, 30)},      // Medium depth water
-    {-0.05f, cv::Scalar(200, 150, 100)},    // Shallow water
-    {0.00f, cv::Scalar(255, 220, 200)},    // Beach - light sand
-    {0.05f, cv::Scalar(80, 180, 50)},      // Grassland - green
-    {0.2f, cv::Scalar(40, 120, 30)},       // Forest - dark green
-    {0.4f, cv::Scalar(80, 70, 60)},        // Rocky mountain - gray/brown
-    {0.6f, cv::Scalar(255, 255, 255)}      // Snow - white
+    {-0.3f, cv::Scalar(50, 10, 10)},
+    {-0.2f, cv::Scalar(100, 20, 20)},
+    {-0.1f, cv::Scalar(150, 60, 30)},
+    {-0.05f, cv::Scalar(200, 150, 100)},
+    {0.00f, cv::Scalar(255, 220, 200)},
+    {0.05f, cv::Scalar(80, 180, 50)},
+    {0.2f, cv::Scalar(40, 120, 30)},
+    {0.4f, cv::Scalar(80, 70, 60)},
+    {0.6f, cv::Scalar(255, 255, 255)}
 };
 
 cv::Scalar interpolate_color(const cv::Scalar& a, const cv::Scalar& b, float t) {
@@ -206,9 +217,7 @@ cv::Scalar interpolate_color(const cv::Scalar& a, const cv::Scalar& b, float t) 
 }
 
 cv::Scalar get_color_from_height(float y_normalized, bool is_water = false) {
-    // If it's water, we treat negative values as depth
     if (is_water) {
-        // Map the negative values to the underwater color stops
         for (size_t i = 1; i < color_gradient.size(); ++i) {
             if (y_normalized >= color_gradient[i-1].position && y_normalized < color_gradient[i].position) {
                 float t = (y_normalized - color_gradient[i - 1].position) /
@@ -217,7 +226,6 @@ cv::Scalar get_color_from_height(float y_normalized, bool is_water = false) {
             }
         }
     }
-    // Normal terrain coloring
     for (size_t i = 1; i < color_gradient.size(); ++i) {
         if (y_normalized <= color_gradient[i].position) {
             float t = (y_normalized - color_gradient[i - 1].position) /
@@ -230,131 +238,191 @@ cv::Scalar get_color_from_height(float y_normalized, bool is_water = false) {
 
 cv::Mat render_terrain(float noise_offset_z) {
     cv::Mat img(height, width, CV_8UC3, cv::Scalar(0, 0, 0));
-    struct Dot {
-        cv::Point pt;
-        int radius;
-        cv::Scalar color;
-        float depth;
-    };
-    std::vector<Dot> dots;
-    for (int i = 0; i <= subdiv_x; ++i) {
-        for (int j = 0; j <= subdiv_z; ++j) {
-            float x = base_grid[i][j][0];
-            float z = base_grid[i][j][1];
-            float rel_z = z - camera_position[2];
-            if (rel_z <= 0.01f) continue;
-            float world_z = z + noise_offset_z;
-            float nx = x * noise_scale;
-            float nz = world_z * noise_scale;
-            float macro_nx = x * macro_noise_scale;
-            float macro_nz = world_z * macro_noise_scale;
-            float fine_noise = fractal_noise(nx, nz);
-            float macro_noise = fractal_noise(macro_nx, macro_nz);
-            float theoretical_y = fine_noise * noise_amplitude + macro_noise * macro_noise_amplitude;
-            float actual_y = std::max(0.0f, theoretical_y);  // Water level at 0
-            bool is_water = (theoretical_y < 0);
-            
-            float y_normalized = std::clamp(theoretical_y / (noise_amplitude + macro_noise_amplitude), -1.0f, 1.0f);
-            cv::Vec3f point(x, actual_y, z);
-            cv::Point proj;
-            if (project_point(point, proj)) {
-                Dot dot;
-                dot.pt = proj;
-                dot.radius = compute_radius(rel_z);
-                dot.color = get_color_from_height(y_normalized, is_water);
-                dot.depth = rel_z;
-                dots.push_back(dot);
+    std::vector<std::vector<Dot>> thread_dots(NUM_THREADS);
+
+    #pragma omp parallel
+    {
+        int thread_id = omp_get_thread_num();
+        #pragma omp for collapse(2) nowait
+        for (int i = 0; i <= subdiv_x; ++i) {
+            for (int j = 0; j <= subdiv_z; ++j) {
+                float x = base_grid[i][j][0];
+                float z = base_grid[i][j][1];
+                float rel_z = z - camera_position[2];
+                if (rel_z <= 0.01f) continue;
+                
+                float world_z = z + noise_offset_z;
+                float nx = x * noise_scale;
+                float nz = world_z * noise_scale;
+                float macro_nx = x * macro_noise_scale;
+                float macro_nz = world_z * macro_noise_scale;
+                
+                float fine_noise = fractal_noise(nx, nz);
+                float macro_noise = fractal_noise(macro_nx, macro_nz);
+                float theoretical_y = fine_noise * noise_amplitude + macro_noise * macro_noise_amplitude;
+                float actual_y = std::max(0.0f, theoretical_y);
+                bool is_water = (theoretical_y < 0);
+                
+                float y_normalized = std::clamp(theoretical_y / (noise_amplitude + macro_noise_amplitude), -1.0f, 1.0f);
+                cv::Vec3f point(x, actual_y, z);
+                cv::Point proj;
+                
+                if (project_point(point, proj)) {
+                    Dot dot;
+                    dot.pt = proj;
+                    dot.radius = compute_radius(rel_z);
+                    dot.color = get_color_from_height(y_normalized, is_water);
+                    dot.depth = rel_z;
+                    thread_dots[thread_id].push_back(dot);
+                }
             }
         }
     }
-    std::sort(dots.begin(), dots.end(), [](const Dot& a, const Dot& b) {
+
+    std::vector<Dot> all_dots;
+    for (auto& vec : thread_dots) {
+        all_dots.insert(all_dots.end(), vec.begin(), vec.end());
+    }
+
+    __gnu_parallel::sort(all_dots.begin(), all_dots.end(), [](const Dot& a, const Dot& b) {
         return a.depth > b.depth;
     });
-    for (const auto& d : dots)
-        cv::circle(img, d.pt, d.radius, d.color, -1);
+
+    #pragma omp parallel
+    {
+        cv::Mat thread_img = img.clone();
+        #pragma omp for nowait
+        for (size_t i = 0; i < all_dots.size(); ++i) {
+            const auto& d = all_dots[i];
+            cv::circle(thread_img, d.pt, d.radius, d.color, -1);
+        }
+        #pragma omp critical
+        cv::add(img, thread_img, img);
+    }
+
     return img;
 }
 
 void render_sky_grid_as_dots(cv::Mat& img, float noise_offset_z) {
-    struct Dot {
-        cv::Point pt;
-        int radius;
-        float depth;
-    };
-    std::vector<Dot> dots;
+    std::vector<std::vector<Dot>> thread_dots(NUM_THREADS);
 
-    for (int i = 0; i <= sky_subdiv_x; ++i) {
-        for (int j = 0; j <= sky_subdiv_z; ++j) {
-            float x = sky_grid[i][j][0];
-            float z = sky_grid[i][j][1];
-            float rel_z = z - camera_position[2];
-            if (rel_z <= 0.01f) continue;
+    #pragma omp parallel
+    {
+        int thread_id = omp_get_thread_num();
+        #pragma omp for collapse(2) nowait
+        for (int i = 0; i <= sky_subdiv_x; ++i) {
+            for (int j = 0; j <= sky_subdiv_z; ++j) {
+                float x = sky_grid[i][j][0];
+                float z = sky_grid[i][j][1];
+                float rel_z = z - camera_position[2];
+                if (rel_z <= 0.01f) continue;
 
-            cv::Vec3f point(x, sky_height, z);
-            cv::Point proj;
+                cv::Vec3f point(x, sky_height, z);
+                cv::Point proj;
 
-            if (project_point(point, proj)) {
-                Dot dot;
-                dot.pt = proj;
-                dot.radius = compute_radius(rel_z);
-                dot.depth = rel_z;
-                dots.push_back(dot);
+                if (project_point(point, proj)) {
+                    Dot dot;
+                    dot.pt = proj;
+                    dot.radius = compute_radius(rel_z);
+                    dot.depth = rel_z;
+                    thread_dots[thread_id].push_back(dot);
+                }
             }
         }
     }
 
-    std::sort(dots.begin(), dots.end(), [](const Dot& a, const Dot& b) {
+    std::vector<Dot> all_dots;
+    for (auto& vec : thread_dots) {
+        all_dots.insert(all_dots.end(), vec.begin(), vec.end());
+    }
+    __gnu_parallel::sort(all_dots.begin(), all_dots.end(), [](const Dot& a, const Dot& b) {
         return a.depth > b.depth;
     });
 
-    for (const auto& d : dots) {
+    #pragma omp parallel for
+    for (size_t i = 0; i < all_dots.size(); ++i) {
+        const auto& d = all_dots[i];
+        #pragma omp critical
         cv::circle(img, d.pt, d.radius, sky_color, -1);
     }
 }
 
-void render_cloud_layer(cv::Mat& img, float noise_offset_z, float height, float noise_scale, float noise_amplitude, float noise_offset_x, float noise_offset_y) {
-    struct Dot {
-        cv::Point pt;
-        int radius;
-        float depth;
-    };
-    std::vector<Dot> dots;
-    for (int i = 0; i <= subdiv_x; ++i) {
-        for (int j = 0; j <= subdiv_z; ++j) {
-            float x = base_grid[i][j][0];
-            float z = base_grid[i][j][1];
-            float rel_z = z - camera_position[2];
-            if (rel_z <= 0.01f) continue;
-            float world_z = z + noise_offset_z;
-            float nx = x * noise_scale;
-            float nz = world_z * noise_scale;
-            float noise_val = fractal_noise(nx, nz, noise_offset_x, noise_offset_y);
-            if (noise_val < 0.5f) continue;
-            float y = height + (1.0f - noise_val) * noise_amplitude;
-            cv::Vec3f point(x, y, z);
-            cv::Point proj;
-            if (project_point(point, proj)) {
-                Dot dot;
-                dot.pt = proj;
-                dot.radius = compute_radius(rel_z);
-                dot.depth = rel_z;
-                dots.push_back(dot);
+void render_cloud_layer(cv::Mat& img, float noise_offset_z, float height, float noise_scale, 
+                       float noise_amplitude, float noise_offset_x, float noise_offset_y) {
+    std::vector<std::vector<Dot>> thread_dots(NUM_THREADS);
+
+    #pragma omp parallel
+    {
+        int thread_id = omp_get_thread_num();
+        #pragma omp for collapse(2) nowait
+        for (int i = 0; i <= subdiv_x; ++i) {
+            for (int j = 0; j <= subdiv_z; ++j) {
+                float x = base_grid[i][j][0];
+                float z = base_grid[i][j][1];
+                float rel_z = z - camera_position[2];
+                if (rel_z <= 0.01f) continue;
+                
+                float world_z = z + noise_offset_z;
+                float nx = x * noise_scale;
+                float nz = world_z * noise_scale;
+                float noise_val = fractal_noise(nx, nz, noise_offset_x, noise_offset_y);
+                
+                if (noise_val < 0.5f) continue;
+                
+                float y = height + (1.0f - noise_val) * noise_amplitude;
+                cv::Vec3f point(x, y, z);
+                cv::Point proj;
+                
+                if (project_point(point, proj)) {
+                    Dot dot;
+                    dot.pt = proj;
+                    dot.radius = compute_radius(rel_z);
+                    dot.depth = rel_z;
+                    thread_dots[thread_id].push_back(dot);
+                }
             }
         }
     }
-    std::sort(dots.begin(), dots.end(), [](const Dot& a, const Dot& b) {
+
+    std::vector<Dot> all_dots;
+    for (auto& vec : thread_dots) {
+        all_dots.insert(all_dots.end(), vec.begin(), vec.end());
+    }
+    __gnu_parallel::sort(all_dots.begin(), all_dots.end(), [](const Dot& a, const Dot& b) {
         return a.depth > b.depth;
     });
-    for (const auto& d : dots)
+
+    #pragma omp parallel for
+    for (size_t i = 0; i < all_dots.size(); ++i) {
+        const auto& d = all_dots[i];
+        #pragma omp critical
         cv::circle(img, d.pt, d.radius, cv::Scalar(160, 160, 255), -1);
+    }
 }
 
 cv::Mat render_combined(float terrain_offset_z, float cloud_offset_z) {
     cv::Mat img = render_terrain(terrain_offset_z);
-    render_sky_grid_as_dots(img, terrain_offset_z);
-    render_cloud_layer(img, cloud_offset_z, cloud_height, cloud_noise_scale, cloud_noise_amplitude, 100.0f, 200.0f);
-    render_cloud_layer(img, cloud_offset_z * 0.6f, cloud_height + 2.0f, cloud_noise_scale * 0.7f, cloud_noise_amplitude * 1.2f, 300.0f, 400.0f);
-    render_cloud_layer(img, cloud_offset_z * 0.4f, cloud_height + 4.0f, cloud_noise_scale * 0.5f, cloud_noise_amplitude * 1.4f, 500.0f, 600.0f);
+    
+    #pragma omp parallel sections
+    {
+        #pragma omp section
+        render_sky_grid_as_dots(img, terrain_offset_z);
+        
+        #pragma omp section
+        render_cloud_layer(img, cloud_offset_z, cloud_height, cloud_noise_scale, 
+                          cloud_noise_amplitude, 100.0f, 200.0f);
+        
+        #pragma omp section
+        render_cloud_layer(img, cloud_offset_z * 0.6f, cloud_height + 2.0f, 
+                          cloud_noise_scale * 0.7f, cloud_noise_amplitude * 1.2f, 
+                          300.0f, 400.0f);
+        
+        #pragma omp section
+        render_cloud_layer(img, cloud_offset_z * 0.4f, cloud_height + 4.0f, 
+                          cloud_noise_scale * 0.5f, cloud_noise_amplitude * 1.4f, 
+                          500.0f, 600.0f);
+    }
+    
     return img;
 }
 
@@ -366,16 +434,19 @@ cv::Mat apply_glow(const cv::Mat& src) {
 }
 
 int main() {
+    omp_set_num_threads(NUM_THREADS);
     generate_base_grid();
     generate_sky_grid();
     init_permutation();
+    
     time_t epoch = std::time(nullptr);
     std::string filename = "terrain_flythrough_" + std::to_string(epoch) + ".mp4";
     cv::VideoWriter writer(filename, cv::VideoWriter::fourcc('m', 'p', '4', 'v'), 60, {width, height});
     if (!writer.isOpened()) {
-        std::cerr << "\u274c Error opening video writer.\n";
+        std::cerr << "Error opening video writer.\n";
         return -1;
     }
+
     const int total_frames = 60 * 60 * 60;
     while (frame_count < total_frames) {
         camera_position[0] = camera_base_x + camera_amplitude_x * sin(frame_count * camera_frequency_x);
@@ -384,16 +455,21 @@ int main() {
         camera_rotation[0] = rotation_amplitude_x * sin(frame_count * rotation_frequency_x);
         camera_rotation[1] = rotation_amplitude_y * sin(frame_count * rotation_frequency_y);
         camera_rotation[2] = rotation_amplitude_z * sin(frame_count * rotation_frequency_z);
+        
         float terrain_offset_z = frame_count * scroll_speed;
         float cloud_offset_z = frame_count * cloud_scroll_speed;
+        
         cv::Mat base = render_combined(terrain_offset_z, cloud_offset_z);
         cv::Mat final = apply_glow(base);
+        
         cv::imshow("Flythrough Terrain", final);
         writer.write(final);
+        
         int key = cv::waitKey(1);
         if (key == 27) break;
         frame_count++;
     }
+    
     writer.release();
     cv::destroyAllWindows();
     return 0;
