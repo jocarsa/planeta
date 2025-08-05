@@ -16,8 +16,8 @@ const int width = 1920;
 const int height = 1080;
 const float plane_width = 400.0f;
 const float plane_depth = 200.0f;
-const int subdiv_x = 800;
-const int subdiv_z = 200;
+const int subdiv_x = 1600;
+const int subdiv_z = 400;
 
 // Sky grid configuration
 const float sky_height = 20.0f;
@@ -70,6 +70,15 @@ const float cloud_threshold_max = 1.0f;
 const float cloud_threshold_min = 0.0f;
 const float cloud_threshold_frequency = 0.001f;
 
+// Tree parameters
+const float max_tree_distance = 60.0f;
+const int max_tree_depth = 4;
+const float min_height_for_trees = 0.1f;
+const float max_height_for_trees = 0.3f;
+const float tree_size_multiplier = 0.01f;  // Add this line - default value of 1.0
+const cv::Scalar tree_trunk_color = cv::Scalar(10, 30, 50);
+const cv::Scalar tree_leaves_color = cv::Scalar(20, 60, 30);
+
 std::vector<std::vector<cv::Vec2f>> base_grid;
 std::vector<std::vector<cv::Vec2f>> sky_grid;
 
@@ -78,6 +87,8 @@ struct Dot {
     int radius;
     cv::Scalar color;
     float depth;
+    float height;
+    bool is_green;
 };
 
 struct PointData {
@@ -258,8 +269,34 @@ cv::Scalar get_color_from_height(float y_normalized, bool is_water = false) {
     }
 }
 
+void draw_pythagorean_tree(cv::Mat& img, const cv::Point& base, float size, float angle, int depth, const cv::Scalar& color) {
+    if (depth <= 0 || size < 1.0f) return;
+    
+    cv::Point tip;
+    // 90° counterclockwise from right (right->up)
+    tip.x = base.x - static_cast<int>(size * sin(angle));  // Negative sin for x
+    tip.y = base.y - static_cast<int>(size * cos(angle));  // Negative cos for y (upward)
+    
+    // Color gradient
+    float t = static_cast<float>(max_tree_depth - depth) / max_tree_depth;
+    cv::Scalar line_color = interpolate_color(tree_trunk_color, tree_leaves_color, t);
+    
+    cv::line(img, base, tip, line_color, std::max(1, depth/2));
+    
+    // Recursive branches
+    float new_size = size * 0.7f;
+    if (depth > 1) {
+        draw_pythagorean_tree(img, tip, new_size, angle - CV_PI/6, depth-1, line_color);  // Left branch
+        draw_pythagorean_tree(img, tip, new_size, angle + CV_PI/6, depth-1, line_color);  // Right branch
+    }
+    
+    // Leaves
+    if (depth == 1) {
+        cv::circle(img, tip, std::max(1, static_cast<int>(size/2)), tree_leaves_color, -1);
+    }
+}
+
 void adaptive_interpolation(std::vector<PointData>& points, std::vector<Dot>& dots, int max_iterations = 3) {
-    // Create a spatial index that works with scrolling
     struct SpatialIndex {
         float cell_size;
         int grid_width;
@@ -300,7 +337,6 @@ void adaptive_interpolation(std::vector<PointData>& points, std::vector<Dot>& do
     float cell_size = plane_width / subdiv_x;
     SpatialIndex index(plane_width, plane_depth, cell_size);
     
-    // Populate the spatial index
     for (auto& p : points) {
         if (p.projected) {
             index.add_point(&p);
@@ -326,13 +362,11 @@ void adaptive_interpolation(std::vector<PointData>& points, std::vector<Dot>& do
                 float screen_dist = cv::norm(p.screen_pos - neighbor->screen_pos);
                 float world_dist = cv::norm(p.world_pos - neighbor->world_pos);
                 
-                // Adaptive distance threshold based on iteration
                 float max_world_dist = cell_size * (2.0f + iteration);
                 
                 if (screen_dist > max_screen_space_distance && 
                     world_dist < max_world_dist) {
                     
-                    // Calculate interpolation weight based on distance
                     float weight = 0.5f * (1.0f - (world_dist / max_world_dist));
                     
                     PointData mid;
@@ -351,7 +385,6 @@ void adaptive_interpolation(std::vector<PointData>& points, std::vector<Dot>& do
             }
         }
         
-        // Add new points to the spatial index
         for (auto& p : new_points) {
             points.push_back(p);
             index.add_point(&points.back());
@@ -361,13 +394,18 @@ void adaptive_interpolation(std::vector<PointData>& points, std::vector<Dot>& do
                 dot.pt = p.screen_pos;
                 dot.radius = compute_radius(p.world_pos[2] - camera_position[2]);
                 float y_normalized = std::clamp(p.theoretical_y / (noise_amplitude + macro_noise_amplitude), -1.0f, 1.0f);
+                dot.height = y_normalized;
                 
                 if (p.is_cloud) {
                     dot.color = cv::Scalar(160, 160, 255);
+                    dot.is_green = false;
                 } else if (p.is_sky) {
                     dot.color = sky_color;
+                    dot.is_green = false;
                 } else {
                     dot.color = get_color_from_height(y_normalized, p.is_water);
+                    // Check if this is green terrain
+                    dot.is_green = (y_normalized >= min_height_for_trees && y_normalized <= max_height_for_trees);
                 }
                 
                 dot.depth = p.world_pos[2] - camera_position[2];
@@ -382,7 +420,6 @@ void adaptive_interpolation(std::vector<PointData>& points, std::vector<Dot>& do
 void render_terrain_with_adaptive_interpolation(float noise_offset_z, std::vector<Dot>& dots) {
     std::vector<PointData> points;
     
-    // First collect all original grid points
     #pragma omp parallel for collapse(2)
     for (int i = 0; i <= subdiv_x; ++i) {
         for (int j = 0; j <= subdiv_z; ++j) {
@@ -416,27 +453,26 @@ void render_terrain_with_adaptive_interpolation(float noise_offset_z, std::vecto
                 {
                     points.push_back(pd);
                     
-                    // Add original point to dots
                     Dot dot;
                     dot.pt = pd.screen_pos;
                     dot.radius = compute_radius(rel_z);
                     float y_normalized = std::clamp(theoretical_y / (noise_amplitude + macro_noise_amplitude), -1.0f, 1.0f);
+                    dot.height = y_normalized;
                     dot.color = get_color_from_height(y_normalized, is_water);
                     dot.depth = rel_z;
+                    dot.is_green = (y_normalized >= min_height_for_trees && y_normalized <= max_height_for_trees);
                     dots.push_back(dot);
                 }
             }
         }
     }
     
-    // Perform adaptive interpolation
     adaptive_interpolation(points, dots);
 }
 
 void render_sky_with_adaptive_interpolation(std::vector<Dot>& dots) {
     std::vector<PointData> points;
     
-    // First collect all original grid points
     #pragma omp parallel for collapse(2)
     for (int i = 0; i <= sky_subdiv_x; ++i) {
         for (int j = 0; j <= sky_subdiv_z; ++j) {
@@ -458,19 +494,18 @@ void render_sky_with_adaptive_interpolation(std::vector<Dot>& dots) {
                 {
                     points.push_back(pd);
                     
-                    // Add original point to dots
                     Dot dot;
                     dot.pt = pd.screen_pos;
                     dot.radius = compute_radius(rel_z);
                     dot.color = sky_color;
                     dot.depth = rel_z;
+                    dot.is_green = false;
                     dots.push_back(dot);
                 }
             }
         }
     }
     
-    // Perform adaptive interpolation
     adaptive_interpolation(points, dots);
 }
 
@@ -480,7 +515,6 @@ void render_clouds_with_adaptive_interpolation(float noise_offset_z, float heigh
                                              std::vector<Dot>& dots) {
     std::vector<PointData> points;
     
-    // First collect all original grid points
     #pragma omp parallel for collapse(2)
     for (int i = 0; i <= subdiv_x; ++i) {
         for (int j = 0; j <= subdiv_z; ++j) {
@@ -511,27 +545,26 @@ void render_clouds_with_adaptive_interpolation(float noise_offset_z, float heigh
                 {
                     points.push_back(pd);
                     
-                    // Add original point to dots
                     Dot dot;
                     dot.pt = pd.screen_pos;
                     dot.radius = compute_radius(rel_z);
                     dot.color = cv::Scalar(160, 160, 255);
                     dot.depth = rel_z;
+                    dot.is_green = false;
                     dots.push_back(dot);
                 }
             }
         }
     }
     
-    // Perform adaptive interpolation
     adaptive_interpolation(points, dots);
 }
 
 cv::Mat render_combined(float terrain_offset_z, float cloud_offset_z, float cloud_threshold) {
     cv::Mat img(height, width, CV_8UC3, cv::Scalar(0, 0, 0));
     std::vector<Dot> dots;
+    std::vector<Dot> tree_dots;
     
-    // Render all components with adaptive interpolation
     #pragma omp parallel sections
     {
         #pragma omp section
@@ -586,12 +619,30 @@ cv::Mat render_combined(float terrain_offset_z, float cloud_offset_z, float clou
         return a.depth > b.depth;
     });
     
-    // Draw all dots - no parallel here to avoid OpenCV conflicts
+    // First pass: draw all dots and collect tree positions
     for (const auto& d : dots) {
         cv::circle(img, d.pt, d.radius, d.color, -1);
+        
+        // Collect positions for trees (green terrain and within distance)
+        if (d.is_green && d.depth < max_tree_distance) {
+            tree_dots.push_back(d);
+        }
     }
     
-    return img.clone(); // Ensure we return a unique copy
+    // Second pass: draw trees
+    for (const auto& d : tree_dots) {
+        // Calculate tree size based on distance (smaller when farther away)
+        float size_factor = 1.0f - (d.depth / max_tree_distance);
+        int tree_size = static_cast<int>(8 + size_factor * 15 * tree_size_multiplier);  // Modified this line
+        
+        // Draw Pythagorean tree (angle starts at -PI/2 to grow straight up)
+        draw_pythagorean_tree(img, d.pt, tree_size, 0.0, max_tree_depth, tree_trunk_color);
+        
+        // Draw a small circle at the base to represent trunk
+        cv::circle(img, d.pt, std::max(1, static_cast<int>(tree_size/4 * tree_size_multiplier)), tree_trunk_color, -1);  // Modified this line
+    }
+    
+    return img.clone();
 }
 
 cv::Mat apply_glow(const cv::Mat& src) {
