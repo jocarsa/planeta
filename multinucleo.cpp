@@ -12,8 +12,8 @@
 #include <utility>
 
 // Configuration
-const int width = 1920;
-const int height = 1080;
+const int width = 720;
+const int height = 360;
 const float plane_width = 400.0f;
 const float plane_depth = 200.0f;
 const int subdiv_x = 1600;
@@ -53,7 +53,7 @@ cv::Vec3f camera_position;
 cv::Vec3f camera_rotation;
 const float camera_base_x = 0.0f;
 const float camera_base_y = 5.0f;
-const float camera_base_z = -5.0f;
+const float camera_base_z = 5.0f;
 const float camera_amplitude_x = 0.05f;
 const float camera_amplitude_y = 0.03f;
 const float camera_amplitude_z = 0.05f;
@@ -67,6 +67,9 @@ const float rotation_frequency_x = 0.002f;
 const float rotation_frequency_y = 0.0025f;
 const float rotation_frequency_z = 0.0015f;
 const float focal_length = 800.0f;
+const float camera_base_pitch = -0.1f;  // Slightly looking downward
+const float camera_base_yaw = 0.0f;    // Straight ahead
+const float camera_base_roll = 0.0f;   // No tilt
 
 const float noise_scale = 0.1f;
 const float noise_amplitude = 1.2f;
@@ -81,7 +84,7 @@ const float cloud_noise_scale = 0.05f;
 const float cloud_noise_amplitude = 1.0f;
 const float cloud_scroll_speed = 0.01f;
 
-const int max_circle_radius = 15;
+const int max_circle_radius = 5;
 const int min_circle_radius = 1;
 const float max_screen_space_distance = 135.0f;
 int frame_count = 0;
@@ -97,7 +100,7 @@ const float max_tree_distance = 60.0f;
 const int max_tree_depth = 4;
 const float min_height_for_trees = 0.1f;
 const float max_height_for_trees = 0.3f;
-const float tree_size_multiplier = 0.1f;
+const float tree_size_multiplier = 0.4f;
 const cv::Scalar tree_trunk_color = cv::Scalar(10, 30, 50);
 const cv::Scalar tree_leaves_color = cv::Scalar(20, 60, 30);
 
@@ -269,11 +272,13 @@ bool project_point(const cv::Vec3f& point3D, cv::Point& projected) {
     return true;
 }
 
+
 int compute_radius(float z) {
-    float depth_min = 1.0f;
-    float depth_max = plane_depth;
-    float norm = std::clamp((z - depth_min) / (depth_max - depth_min), 0.0f, 1.0f);
-    return std::round(max_circle_radius * (1.0f - norm) + min_circle_radius * norm);
+    z = std::max(z, 1.0f);  // Ensure z >= 1.0
+    float normalized_z = z / plane_depth;  // Normalize to [0,1] range
+    float perspective_scale = 1.0f / normalized_z;  // Inverse relationship
+    float t = std::clamp(perspective_scale, 0.0f, 1.0f);
+    return std::round(min_circle_radius + t * (max_circle_radius - min_circle_radius));
 }
 
 struct ColorStop {
@@ -324,12 +329,15 @@ cv::Scalar get_color_from_height(float y_normalized, bool is_water = false) {
 
 void draw_pythagorean_tree(cv::Mat& img, const cv::Point& base, float size, float angle, int depth, 
                           const cv::Scalar& color, float size_multiplier, float tree_depth) {
-    if (depth <= 0 || size < 1.0f) return;
+    // Base case - stop recursion when depth reaches 0 or size becomes too small
+    if (depth <= 0 || size < 0.5f) return;
     
+    // Calculate tip position
     cv::Point tip;
     tip.x = base.x - static_cast<int>(size * sin(angle));
     tip.y = base.y - static_cast<int>(size * cos(angle));
     
+    // Calculate color interpolation based on depth
     float t = static_cast<float>(max_tree_depth - depth) / max_tree_depth;
     cv::Scalar line_color = interpolate_color(
         apply_fog(tree_trunk_color, tree_depth),
@@ -337,19 +345,28 @@ void draw_pythagorean_tree(cv::Mat& img, const cv::Point& base, float size, floa
         t
     );
     
-    // Anti-aliased line
-    cv::line(img, base, tip, line_color, std::max(1, depth/2), line_type);
+    // Draw the branch - thickness now scales with original size_multiplier but not recursively
+    int thickness = std::max(1, static_cast<int>(1.5f + depth * 0.5f));
+    cv::line(img, base, tip, line_color, thickness, line_type);
     
-    float new_size = size * 0.7f * size_multiplier;
-    if (depth > 1) {
-        draw_pythagorean_tree(img, tip, new_size, angle - CV_PI/6, depth-1, line_color, size_multiplier, tree_depth);
-        draw_pythagorean_tree(img, tip, new_size, angle + CV_PI/6, depth-1, line_color, size_multiplier, tree_depth);
+    // Calculate new size - size_multiplier is only applied at the initial call
+    float size_reduction = 0.65f + 0.05f * (depth / static_cast<float>(max_tree_depth));
+    float new_size = size * size_reduction;
+    
+    // Draw leaves at terminal branches (depth <= 2)
+    if (depth <= 2) {
+        int leaf_size = std::max(1, static_cast<int>(2.0f + size * 0.3f));
+        cv::circle(img, tip, leaf_size, 
+                  apply_fog(tree_leaves_color, tree_depth), -1, line_type);
     }
     
-    if (depth == 1) {
-        // Anti-aliased circle
-        cv::circle(img, tip, std::max(1, static_cast<int>(size/2 * size_multiplier)), 
-                  apply_fog(tree_leaves_color, tree_depth), -1, line_type);
+    // Recursive calls with adjusted angles
+    if (depth > 1) {
+        float angle_variation = CV_PI/5.0f * (0.8f + 0.4f * depth/static_cast<float>(max_tree_depth));
+        draw_pythagorean_tree(img, tip, new_size, angle - angle_variation, depth-1, 
+                            line_color, 1.0f, tree_depth);  // Note size_multiplier = 1.0f
+        draw_pythagorean_tree(img, tip, new_size, angle + angle_variation, depth-1, 
+                            line_color, 1.0f, tree_depth);  // Note size_multiplier = 1.0f
     }
 }
 
@@ -744,9 +761,9 @@ int main() {
             camera_position[1] = camera_base_y + camera_amplitude_y * sin(frame_count * camera_frequency_y);
             camera_position[2] = camera_base_z + camera_amplitude_z * sin(frame_count * camera_frequency_z);
             
-            camera_rotation[0] = rotation_amplitude_x * sin(frame_count * rotation_frequency_x);
-            camera_rotation[1] = rotation_amplitude_y * sin(frame_count * rotation_frequency_y);
-            camera_rotation[2] = rotation_amplitude_z * sin(frame_count * rotation_frequency_z);
+            camera_rotation[0] = camera_base_pitch + rotation_amplitude_x * sin(frame_count * rotation_frequency_x);
+            camera_rotation[1] = camera_base_yaw + rotation_amplitude_y * sin(frame_count * rotation_frequency_y);
+            camera_rotation[2] = camera_base_roll + rotation_amplitude_z * sin(frame_count * rotation_frequency_z);
             
             float terrain_offset_z = frame_count * scroll_speed;
             float cloud_offset_z = frame_count * cloud_scroll_speed;
