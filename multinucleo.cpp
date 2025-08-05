@@ -19,13 +19,35 @@ const float plane_depth = 200.0f;
 const int subdiv_x = 1600;
 const int subdiv_z = 400;
 
+// Anti-aliasing configuration
+const int line_type = cv::LINE_AA;  // Anti-aliased drawing for all elements
+
+// Glow configuration
+const float glow_intensity = 0.05f;
+const int glow_blur_size = 5;
+
+// Fog configuration
+const float fog_near = 20.0f;
+const float fog_far = 400.0f;
+const cv::Scalar fog_color = cv::Scalar(255, 255, 255);
+const float fog_density = 1.0f;
+
+// Sky fog configuration
+const float sky_fog_near = 40.0f;
+const float sky_fog_far = 400.0f;
+const cv::Scalar sky_fog_color = cv::Scalar(255,255,255);
+const float sky_fog_density = 1.0f;
+
 // Sky grid configuration
 const float sky_height = 20.0f;
-const int sky_subdiv_x = 300;
-const int sky_subdiv_z = 100;
+const int sky_subdiv_x = 1200;
+const int sky_subdiv_z = 300;
 const float sky_plane_width = 1600.0f;
 const float sky_plane_depth = 800.0f;
 const cv::Scalar sky_color = cv::Scalar(255, 0, 0);
+
+// Window background configuration
+const cv::Scalar window_bg_color = cv::Scalar(255,255,255);
 
 cv::Vec3f camera_position;
 cv::Vec3f camera_rotation;
@@ -59,7 +81,7 @@ const float cloud_noise_scale = 0.05f;
 const float cloud_noise_amplitude = 1.0f;
 const float cloud_scroll_speed = 0.01f;
 
-const int max_circle_radius = 10;
+const int max_circle_radius = 15;
 const int min_circle_radius = 1;
 const float max_screen_space_distance = 135.0f;
 int frame_count = 0;
@@ -75,7 +97,7 @@ const float max_tree_distance = 60.0f;
 const int max_tree_depth = 4;
 const float min_height_for_trees = 0.1f;
 const float max_height_for_trees = 0.3f;
-const float tree_size_multiplier = 0.01f;  // Add this line - default value of 1.0
+const float tree_size_multiplier = 0.1f;
 const cv::Scalar tree_trunk_color = cv::Scalar(10, 30, 50);
 const cv::Scalar tree_leaves_color = cv::Scalar(20, 60, 30);
 
@@ -102,6 +124,37 @@ struct PointData {
 };
 
 const int NUM_THREADS = omp_get_max_threads();
+
+cv::Scalar apply_fog(const cv::Scalar& original_color, float distance, bool is_sky = false) {
+    if (is_sky) {
+        float fog_factor = 0.0f;
+        if (distance > sky_fog_near) {
+            float normalized_dist = (distance - sky_fog_near) / (sky_fog_far - sky_fog_near);
+            normalized_dist = std::clamp(normalized_dist, 0.0f, 1.0f);
+            fog_factor = 1.0f - exp(-sky_fog_density * normalized_dist * 5.0f);
+        }
+        
+        cv::Scalar result;
+        for (int i = 0; i < 3; i++) {
+            result[i] = original_color[i] * (1.0f - fog_factor) + sky_fog_color[i] * fog_factor;
+        }
+        return result;
+    }
+    else {
+        float fog_factor = 0.0f;
+        if (distance > fog_near) {
+            float normalized_dist = (distance - fog_near) / (fog_far - fog_near);
+            normalized_dist = std::clamp(normalized_dist, 0.0f, 1.0f);
+            fog_factor = 1.0f - exp(-fog_density * normalized_dist * 5.0f);
+        }
+        
+        cv::Scalar result;
+        for (int i = 0; i < 3; i++) {
+            result[i] = original_color[i] * (1.0f - fog_factor) + fog_color[i] * fog_factor;
+        }
+        return result;
+    }
+}
 
 void generate_base_grid() {
     base_grid.resize(subdiv_x + 1, std::vector<cv::Vec2f>(subdiv_z + 1));
@@ -269,30 +322,34 @@ cv::Scalar get_color_from_height(float y_normalized, bool is_water = false) {
     }
 }
 
-void draw_pythagorean_tree(cv::Mat& img, const cv::Point& base, float size, float angle, int depth, const cv::Scalar& color) {
+void draw_pythagorean_tree(cv::Mat& img, const cv::Point& base, float size, float angle, int depth, 
+                          const cv::Scalar& color, float size_multiplier, float tree_depth) {
     if (depth <= 0 || size < 1.0f) return;
     
     cv::Point tip;
-    // 90° counterclockwise from right (right->up)
-    tip.x = base.x - static_cast<int>(size * sin(angle));  // Negative sin for x
-    tip.y = base.y - static_cast<int>(size * cos(angle));  // Negative cos for y (upward)
+    tip.x = base.x - static_cast<int>(size * sin(angle));
+    tip.y = base.y - static_cast<int>(size * cos(angle));
     
-    // Color gradient
     float t = static_cast<float>(max_tree_depth - depth) / max_tree_depth;
-    cv::Scalar line_color = interpolate_color(tree_trunk_color, tree_leaves_color, t);
+    cv::Scalar line_color = interpolate_color(
+        apply_fog(tree_trunk_color, tree_depth),
+        apply_fog(tree_leaves_color, tree_depth),
+        t
+    );
     
-    cv::line(img, base, tip, line_color, std::max(1, depth/2));
+    // Anti-aliased line
+    cv::line(img, base, tip, line_color, std::max(1, depth/2), line_type);
     
-    // Recursive branches
-    float new_size = size * 0.7f;
+    float new_size = size * 0.7f * size_multiplier;
     if (depth > 1) {
-        draw_pythagorean_tree(img, tip, new_size, angle - CV_PI/6, depth-1, line_color);  // Left branch
-        draw_pythagorean_tree(img, tip, new_size, angle + CV_PI/6, depth-1, line_color);  // Right branch
+        draw_pythagorean_tree(img, tip, new_size, angle - CV_PI/6, depth-1, line_color, size_multiplier, tree_depth);
+        draw_pythagorean_tree(img, tip, new_size, angle + CV_PI/6, depth-1, line_color, size_multiplier, tree_depth);
     }
     
-    // Leaves
     if (depth == 1) {
-        cv::circle(img, tip, std::max(1, static_cast<int>(size/2)), tree_leaves_color, -1);
+        // Anti-aliased circle
+        cv::circle(img, tip, std::max(1, static_cast<int>(size/2 * size_multiplier)), 
+                  apply_fog(tree_leaves_color, tree_depth), -1, line_type);
     }
 }
 
@@ -397,14 +454,13 @@ void adaptive_interpolation(std::vector<PointData>& points, std::vector<Dot>& do
                 dot.height = y_normalized;
                 
                 if (p.is_cloud) {
-                    dot.color = cv::Scalar(160, 160, 255);
+                    dot.color = apply_fog(cv::Scalar(160, 160, 255), dot.depth);
                     dot.is_green = false;
                 } else if (p.is_sky) {
-                    dot.color = sky_color;
+                    dot.color = apply_fog(sky_color, dot.depth, true);
                     dot.is_green = false;
                 } else {
-                    dot.color = get_color_from_height(y_normalized, p.is_water);
-                    // Check if this is green terrain
+                    dot.color = apply_fog(get_color_from_height(y_normalized, p.is_water), dot.depth);
                     dot.is_green = (y_normalized >= min_height_for_trees && y_normalized <= max_height_for_trees);
                 }
                 
@@ -458,7 +514,7 @@ void render_terrain_with_adaptive_interpolation(float noise_offset_z, std::vecto
                     dot.radius = compute_radius(rel_z);
                     float y_normalized = std::clamp(theoretical_y / (noise_amplitude + macro_noise_amplitude), -1.0f, 1.0f);
                     dot.height = y_normalized;
-                    dot.color = get_color_from_height(y_normalized, is_water);
+                    dot.color = apply_fog(get_color_from_height(y_normalized, is_water), rel_z);
                     dot.depth = rel_z;
                     dot.is_green = (y_normalized >= min_height_for_trees && y_normalized <= max_height_for_trees);
                     dots.push_back(dot);
@@ -497,7 +553,7 @@ void render_sky_with_adaptive_interpolation(std::vector<Dot>& dots) {
                     Dot dot;
                     dot.pt = pd.screen_pos;
                     dot.radius = compute_radius(rel_z);
-                    dot.color = sky_color;
+                    dot.color = apply_fog(sky_color, rel_z, true);
                     dot.depth = rel_z;
                     dot.is_green = false;
                     dots.push_back(dot);
@@ -548,7 +604,7 @@ void render_clouds_with_adaptive_interpolation(float noise_offset_z, float heigh
                     Dot dot;
                     dot.pt = pd.screen_pos;
                     dot.radius = compute_radius(rel_z);
-                    dot.color = cv::Scalar(160, 160, 255);
+                    dot.color = apply_fog(cv::Scalar(160, 160, 255), rel_z);
                     dot.depth = rel_z;
                     dot.is_green = false;
                     dots.push_back(dot);
@@ -561,7 +617,7 @@ void render_clouds_with_adaptive_interpolation(float noise_offset_z, float heigh
 }
 
 cv::Mat render_combined(float terrain_offset_z, float cloud_offset_z, float cloud_threshold) {
-    cv::Mat img(height, width, CV_8UC3, cv::Scalar(0, 0, 0));
+    cv::Mat img(height, width, CV_8UC3, window_bg_color);
     std::vector<Dot> dots;
     std::vector<Dot> tree_dots;
     
@@ -619,36 +675,43 @@ cv::Mat render_combined(float terrain_offset_z, float cloud_offset_z, float clou
         return a.depth > b.depth;
     });
     
-    // First pass: draw all dots and collect tree positions
+    // First pass: draw all dots with anti-aliasing
     for (const auto& d : dots) {
-        cv::circle(img, d.pt, d.radius, d.color, -1);
+        cv::circle(img, d.pt, d.radius, d.color, -1, line_type);
         
-        // Collect positions for trees (green terrain and within distance)
         if (d.is_green && d.depth < max_tree_distance) {
             tree_dots.push_back(d);
         }
     }
     
-    // Second pass: draw trees
+    // Second pass: draw trees with anti-aliasing
     for (const auto& d : tree_dots) {
-        // Calculate tree size based on distance (smaller when farther away)
         float size_factor = 1.0f - (d.depth / max_tree_distance);
-        int tree_size = static_cast<int>(8 + size_factor * 15 * tree_size_multiplier);  // Modified this line
+        int tree_size = static_cast<int>(8 + size_factor * 15);
         
-        // Draw Pythagorean tree (angle starts at -PI/2 to grow straight up)
-        draw_pythagorean_tree(img, d.pt, tree_size, 0.0, max_tree_depth, tree_trunk_color);
+        draw_pythagorean_tree(img, d.pt, tree_size * tree_size_multiplier, 0.0, max_tree_depth, 
+                            tree_trunk_color, tree_size_multiplier, d.depth);
         
-        // Draw a small circle at the base to represent trunk
-        cv::circle(img, d.pt, std::max(1, static_cast<int>(tree_size/4 * tree_size_multiplier)), tree_trunk_color, -1);  // Modified this line
+        cv::circle(img, d.pt, std::max(1, static_cast<int>(tree_size/4 * tree_size_multiplier)), 
+                  apply_fog(tree_trunk_color, d.depth), -1, line_type);
     }
     
     return img.clone();
 }
 
 cv::Mat apply_glow(const cv::Mat& src) {
-    cv::Mat blurred, result;
-    cv::GaussianBlur(src, blurred, cv::Size(0, 0), 4);
-    cv::add(src, blurred, result);
+    if (glow_intensity <= 0.0f) return src.clone();
+    
+    cv::Mat blurred;
+    cv::GaussianBlur(src, blurred, 
+                    cv::Size(glow_blur_size, glow_blur_size), 
+                    glow_blur_size * 0.6, 0, 
+                    cv::BORDER_DEFAULT);
+    
+    cv::Mat result;
+    cv::addWeighted(src, 1.0f - glow_intensity, 
+                   blurred, glow_intensity, 
+                   0.0, result);
     return result;
 }
 
@@ -657,44 +720,68 @@ int main() {
     generate_base_grid();
     generate_sky_grid();
     init_permutation();
-    
+
     time_t epoch = std::time(nullptr);
     std::string filename = "terrain_flythrough_" + std::to_string(epoch) + ".mp4";
     cv::VideoWriter writer;
     writer.open(filename, cv::VideoWriter::fourcc('m', 'p', '4', 'v'), 60, cv::Size(width, height));
-    
+
     if (!writer.isOpened()) {
         std::cerr << "Error opening video writer.\n";
         return -1;
     }
-    
+
+    cv::namedWindow("Flythrough Terrain", cv::WINDOW_NORMAL | cv::WINDOW_GUI_EXPANDED);
+    cv::resizeWindow("Flythrough Terrain", width, height);
+
     const int total_frames = 60 * 60 * 60;
+    cv::Mat display_img;
+    bool paused = false;
+
     while (frame_count < total_frames) {
-        camera_position[0] = camera_base_x + camera_amplitude_x * sin(frame_count * camera_frequency_x);
-        camera_position[1] = camera_base_y + camera_amplitude_y * sin(frame_count * camera_frequency_y);
-        camera_position[2] = camera_base_z + camera_amplitude_z * sin(frame_count * camera_frequency_z);
-        
-        camera_rotation[0] = rotation_amplitude_x * sin(frame_count * rotation_frequency_x);
-        camera_rotation[1] = rotation_amplitude_y * sin(frame_count * rotation_frequency_y);
-        camera_rotation[2] = rotation_amplitude_z * sin(frame_count * rotation_frequency_z);
-        
-        float terrain_offset_z = frame_count * scroll_speed;
-        float cloud_offset_z = frame_count * cloud_scroll_speed;
-        float cloud_threshold = cloud_threshold_min + (cloud_threshold_max - cloud_threshold_min) * 
-                              0.5f * (1.0f + sin(frame_count * cloud_threshold_frequency));
-        
-        cv::Mat base = render_combined(terrain_offset_z, cloud_offset_z, cloud_threshold);
-        cv::Mat final = apply_glow(base);
-        
-        cv::imshow("Flythrough Terrain", final);
-        writer.write(final);
+        if (!paused) {
+            camera_position[0] = camera_base_x + camera_amplitude_x * sin(frame_count * camera_frequency_x);
+            camera_position[1] = camera_base_y + camera_amplitude_y * sin(frame_count * camera_frequency_y);
+            camera_position[2] = camera_base_z + camera_amplitude_z * sin(frame_count * camera_frequency_z);
+            
+            camera_rotation[0] = rotation_amplitude_x * sin(frame_count * rotation_frequency_x);
+            camera_rotation[1] = rotation_amplitude_y * sin(frame_count * rotation_frequency_y);
+            camera_rotation[2] = rotation_amplitude_z * sin(frame_count * rotation_frequency_z);
+            
+            float terrain_offset_z = frame_count * scroll_speed;
+            float cloud_offset_z = frame_count * cloud_scroll_speed;
+            float cloud_threshold = cloud_threshold_min + (cloud_threshold_max - cloud_threshold_min) * 
+                                  0.5f * (1.0f + sin(frame_count * cloud_threshold_frequency));
+            
+            cv::Mat base = render_combined(terrain_offset_z, cloud_offset_z, cloud_threshold);
+            cv::Mat final = apply_glow(base);
+            
+            if (cv::getWindowProperty("Flythrough Terrain", cv::WND_PROP_ASPECT_RATIO) > 0) {
+                double scale = std::min(
+                    cv::getWindowImageRect("Flythrough Terrain").width / (double)final.cols,
+                    cv::getWindowImageRect("Flythrough Terrain").height / (double)final.rows
+                );
+                cv::resize(final, display_img, cv::Size(), scale, scale, cv::INTER_LINEAR);
+            } else {
+                display_img = final;
+            }
+            
+            writer.write(final);
+            frame_count++;
+        }
+
+        cv::imshow("Flythrough Terrain", display_img);
         
         int key = cv::waitKey(1);
         if (key == 27) break;
-        
-        frame_count++;
+        else if (key == ' ') paused = !paused;
+        else if (key == 'f') {
+            cv::setWindowProperty("Flythrough Terrain", cv::WND_PROP_FULLSCREEN, 
+                                cv::getWindowProperty("Flythrough Terrain", cv::WND_PROP_FULLSCREEN) ? 
+                                cv::WINDOW_NORMAL : cv::WINDOW_FULLSCREEN);
+        }
     }
-    
+
     writer.release();
     cv::destroyAllWindows();
     return 0;
